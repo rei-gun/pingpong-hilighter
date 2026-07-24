@@ -1,6 +1,8 @@
 .env
 *.mp4
+*.wav
 __pycache__/
 .venv/
 venv/
+batch_run.log
 .DS_Store
