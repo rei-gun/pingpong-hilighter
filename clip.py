@@ -20,6 +20,12 @@ PROMPT = (PROJECT_ROOT / "prompt.txt").read_text(encoding="utf-8")
 
 MAX_UPLOAD_BYTES = 1_900_000_000  # keep under Gemini's 2GB File API limit
 REACTION_PAD_SEC = 2.0  # safety pad beyond the model's end (prompt already asks for reaction)
+MIN_CLIP_SEC = 10.0  # hard floor — drop/expand anything shorter
+MAX_CLIP_BYTES = 180 * 1024 * 1024  # hard ceiling per output clip
+
+# Gemini samples video at 1 fps by default, which skips whole shots in fast rallies.
+# Ordered fallbacks: drop to a lower rate if the request is rejected or quota-limited.
+ANALYSIS_FPS_LADDER = (4.0, 2.0, 1.0)
 
 # Manual cue: shout "HIGHLIGHT" + a loud clap (usually together).
 CUE_LOOKBACK_SEC = 18.0  # cover the rally that just happened before the cue
@@ -326,10 +332,162 @@ def merge_highlights(gemini_clips: List[dict], cue_clips: List[dict]) -> List[di
     return merged
 
 
+def drop_past_end(clips: List[dict], duration: Optional[float]) -> List[dict]:
+    """Drop windows that start after the video ends.
+
+    A timestamp past the file makes ffmpeg clamp every such clip to the same
+    final seconds, which is how identical file sizes show up.
+    """
+    if duration is None:
+        return clips
+    kept = []
+    for clip in clips:
+        start = float(clip["start"])
+        end = min(float(clip["end"]), duration)
+        if start >= duration - 1.0 or end - start < 1.0:
+            print(
+                f"  dropped clip past end of video ({start:.1f}-{float(clip['end']):.1f}s, "
+                f"video is {duration:.1f}s): {clip.get('description', '')}"
+            )
+            continue
+        out = dict(clip)
+        out["start"] = round(start, 2)
+        out["end"] = round(end, 2)
+        kept.append(out)
+    return kept
+
+
+def drop_overlapping_duplicates(clips: List[dict]) -> List[dict]:
+    """Keep the longer clip when two windows cover the same rally.
+
+    Runs after min-duration padding, which is what pushes otherwise distinct
+    picks into overlap. Cue clips are hard includes and always survive.
+    """
+    ordered = sorted(clips, key=lambda c: float(c["end"]) - float(c["start"]), reverse=True)
+    kept: List[dict] = []
+    for clip in ordered:
+        clash = next((k for k in kept if intervals_overlap(clip, k)), None)
+        if clash is None:
+            kept.append(clip)
+            continue
+        if clip.get("source") == "cue" and clash.get("source") != "cue":
+            kept.remove(clash)
+            kept.append(clip)
+            print(
+                f"  deduped: dropped {clash['start']:.1f}-{clash['end']:.1f}s "
+                f"in favour of cue {clip['start']:.1f}-{clip['end']:.1f}s"
+            )
+            continue
+        print(
+            f"  deduped: dropped {clip['start']:.1f}-{clip['end']:.1f}s "
+            f"(overlaps longer clip {clash['start']:.1f}-{clash['end']:.1f}s)"
+        )
+
+    kept.sort(key=lambda c: float(c["start"]))
+    return kept
+
+
+def enforce_min_duration(
+    clips: List[dict], duration: Optional[float] = None
+) -> List[dict]:
+    """Expand windows to meet MIN_CLIP_SEC; drop clips that still can't."""
+    enforced = []
+    for clip in clips:
+        start = float(clip["start"])
+        end = float(clip["end"])
+        length = end - start
+        if length < MIN_CLIP_SEC:
+            deficit = MIN_CLIP_SEC - length
+            start = max(0.0, start - deficit)
+            end = start + MIN_CLIP_SEC
+            if duration is not None and end > duration:
+                end = duration
+                start = max(0.0, end - MIN_CLIP_SEC)
+        if end - start < MIN_CLIP_SEC - 0.05:
+            print(
+                f"  skipping too-short clip ({end - start:.1f}s): "
+                f"{clip.get('description', '')}"
+            )
+            continue
+        out = dict(clip)
+        out["start"] = round(start, 2)
+        out["end"] = round(end, 2)
+        enforced.append(out)
+    return enforced
+
+
+def video_duration_sec(video_path: Path) -> Optional[float]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def compress_clip_to_max_size(path: Path, duration_sec: float) -> None:
+    """Re-encode a clip so it fits under MAX_CLIP_BYTES."""
+    if path.stat().st_size <= MAX_CLIP_BYTES:
+        return
+    target_bits = int(MAX_CLIP_BYTES * 8 * 0.90)
+    audio_bps = 128_000
+    video_bps = max(500_000, int(target_bits / max(duration_sec, 1.0) - audio_bps))
+    tmp = path.with_suffix(".tmp.mp4")
+    print(
+        f"  {path.name} is {path.stat().st_size / 1e6:.0f}MB (>180MB); "
+        f"re-encoding @ ~{video_bps // 1000}kbps video"
+    )
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-b:v",
+        str(video_bps),
+        "-maxrate",
+        str(int(video_bps * 1.2)),
+        "-bufsize",
+        str(int(video_bps * 2)),
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        str(tmp),
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    tmp.replace(path)
+
+
 def cut_clips(video_path: Path, output_dir: Path, highlights: List[dict]) -> None:
+    duration = video_duration_sec(video_path)
+    highlights = enforce_min_duration(highlights, duration=duration)
+    if not highlights:
+        print("No clips left after min-duration filter.")
+        return
+
     for idx, clip in enumerate(highlights, 1):
         start_sec = float(clip["start"])
         end_sec = float(clip["end"]) + REACTION_PAD_SEC
+        if duration is not None:
+            end_sec = min(end_sec, duration)
+        if end_sec - start_sec < MIN_CLIP_SEC:
+            start_sec = max(0.0, end_sec - MIN_CLIP_SEC)
+
         output_filename = output_dir / f"highlight_{idx:02d}.mp4"
         cmd = [
             "ffmpeg",
@@ -345,32 +503,84 @@ def cut_clips(video_path: Path, output_dir: Path, highlights: List[dict]) -> Non
             str(output_filename),
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        clip_dur = max(end_sec - start_sec, 1.0)
+        if output_filename.exists():
+            compress_clip_to_max_size(output_filename, clip_dur)
+            size_mb = output_filename.stat().st_size / 1e6
+        else:
+            size_mb = 0
         source = clip.get("source", "?")
         print(
             f"Saved {output_filename.name} [{source}] ({clip['description']}) "
-            f"[{start_sec}s -> {end_sec}s]"
+            f"[{start_sec}s -> {end_sec}s] ({size_mb:.0f}MB)"
         )
 
 
+BARE_TIMECODE_RE = re.compile(r'("(?:start|end)"\s*:\s*)(\d{1,2}(?::\d{2})+(?:\.\d+)?)')
+JSON_OBJECT_RE = re.compile(r"\{[^{}]*\}", flags=re.DOTALL)
+
+
+def parse_timestamp(value) -> Optional[float]:
+    """Seconds from a number, a numeric string, or an MM:SS / HH:MM:SS timecode."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        if ":" not in text:
+            return float(text)
+        seconds = 0.0
+        for part in text.split(":"):
+            seconds = seconds * 60.0 + float(part)
+        return seconds
+    except ValueError:
+        return None
+
+
+def salvage_json_objects(raw: str) -> List[dict]:
+    """Recover complete {...} records from malformed or truncated output."""
+    items = []
+    for match in JSON_OBJECT_RE.finditer(raw):
+        try:
+            obj = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            items.append(obj)
+    return items
+
+
 def parse_gemini_json(text: str) -> List[dict]:
-    """Parse Gemini JSON output, tolerating fences / trailing junk."""
+    """Parse Gemini JSON output, tolerating fences, timecodes, and truncation."""
     if not text or not text.strip():
         return []
     raw = text.strip()
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
+    raw = BARE_TIMECODE_RE.sub(r'\1"\2"', raw)
+
+    data = None
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
-        if not match:
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                data = None
+    if data is None:
+        data = salvage_json_objects(raw)
+        if data:
+            print(f"NOTE: recovered {len(data)} record(s) from malformed Gemini JSON.")
+        else:
             print(f"WARNING: could not parse Gemini JSON, raw preview: {raw[:300]!r}")
-            return []
-        try:
-            data = json.loads(match.group(0))
-        except json.JSONDecodeError as exc:
-            print(f"WARNING: JSON repair failed ({exc}), raw preview: {raw[:300]!r}")
             return []
     if not isinstance(data, list):
         return []
@@ -378,32 +588,76 @@ def parse_gemini_json(text: str) -> List[dict]:
     for item in data:
         if not isinstance(item, dict):
             continue
-        if "start" not in item or "end" not in item:
+        start = parse_timestamp(item.get("start"))
+        end = parse_timestamp(item.get("end"))
+        if start is None or end is None or end <= start:
+            print(f"WARNING: skipping clip with bad times: {item!r}")
             continue
-        clips.append(item)
+        clips.append(
+            {
+                "start": start,
+                "end": end,
+                "description": item.get("description", "Gemini highlight"),
+            }
+        )
     return clips
 
 
-def generate_highlights(client: genai.Client, video_file, retries: int = 3) -> List[dict]:
+def build_video_contents(video_file, fps: float) -> List[types.Content]:
+    """Video part sampled at `fps`, plus the prompt. fps must be in (0, 24]."""
+    video_part = types.Part(
+        file_data=types.FileData(
+            file_uri=video_file.uri,
+            mime_type=getattr(video_file, "mime_type", None) or "video/mp4",
+        ),
+        video_metadata=types.VideoMetadata(fps=fps),
+    )
+    return [types.Content(parts=[video_part, types.Part(text=PROMPT)])]
+
+
+def analyze_at_fps(client: genai.Client, video_file, fps: float, retries: int = 3) -> List[dict]:
+    """One analysis pass at a fixed sampling rate. Raises on unrecoverable errors."""
     last_err = None
     for attempt in range(1, retries + 1):
         try:
-            print(f"Analyzing video with Gemini Flash (attempt {attempt}/{retries})...")
+            print(f"Analyzing video with Gemini Flash at {fps:g} fps (attempt {attempt}/{retries})...")
             response = client.models.generate_content(
-                model="gemini-flash-latest",
-                contents=[video_file, PROMPT],
+                model="gemini-3.8-flash",
+                contents=build_video_contents(video_file, fps),
                 config=types.GenerateContentConfig(response_mime_type="application/json"),
             )
             return parse_gemini_json(response.text or "")
         except Exception as exc:
             last_err = exc
             msg = str(exc)
-            retryable = any(code in msg for code in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
+            retryable = any(
+                code in msg for code in ("503", "UNAVAILABLE", "timeout", "Timeout", "DEADLINE")
+            )
             if not retryable or attempt == retries:
                 raise
             wait = 15 * attempt
             print(f"  transient error: {exc}; retrying in {wait}s...")
             time.sleep(wait)
+    raise last_err  # pragma: no cover
+
+
+def generate_highlights(client: genai.Client, video_file) -> List[dict]:
+    """Analyze at the highest sampling rate the API/quota allows, stepping down if needed."""
+    last_err = None
+    for fps in ANALYSIS_FPS_LADDER:
+        try:
+            return analyze_at_fps(client, video_file, fps)
+        except Exception as exc:
+            last_err = exc
+            msg = str(exc)
+            degradable = any(
+                code in msg
+                for code in ("429", "RESOURCE_EXHAUSTED", "400", "INVALID_ARGUMENT", "extra_forbidden")
+            )
+            if not degradable or fps == ANALYSIS_FPS_LADDER[-1]:
+                raise
+            print(f"  {fps:g} fps rejected ({msg[:140]}); retrying at a lower rate...")
+            time.sleep(10)
     raise last_err  # pragma: no cover
 
 
@@ -438,7 +692,11 @@ def process_video(client: genai.Client, video_path: Path, project_root: Path) ->
     print(f"Gemini found {len(gemini_clips)} highlights; cues found {len(cue_clips)}.")
 
     highlights = merge_highlights(gemini_clips, cue_clips)
-    print(f"Merged total: {len(highlights)} highlights.")
+    duration = video_duration_sec(video_path)
+    highlights = enforce_min_duration(highlights, duration=duration)
+    highlights = drop_past_end(highlights, duration)
+    highlights = drop_overlapping_duplicates(highlights)
+    print(f"Merged total: {len(highlights)} highlights (after >= {MIN_CLIP_SEC:.0f}s filter).")
     highlights_path.write_text(json.dumps(highlights, indent=2))
 
     cut_clips(video_path, output_dir, highlights)
@@ -453,7 +711,8 @@ def main() -> None:
         sys.exit(1)
 
     project_root = PROJECT_ROOT
-    client = genai.Client()
+    # 4 fps analysis of a long file can take several minutes; don't wait forever.
+    client = genai.Client(http_options=types.HttpOptions(timeout=15 * 60 * 1000))
 
     ok, failed = [], []
     for arg in sys.argv[1:]:
